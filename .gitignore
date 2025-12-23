@@ -70,3 +70,6 @@ backend/faiss_indexes/
 
 # OS
 Thumbs.db
+
+# Local nested repo or sample app we don't track
+my-app/
