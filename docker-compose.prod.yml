@@ -1,0 +1,57 @@
+version: "3.8"
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: meeting_assistant_db
+    environment:
+      POSTGRES_USER: assistant_user
+      POSTGRES_PASSWORD: secure_password_123
+      POSTGRES_DB: meeting_assistant
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U assistant_user"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - meeting-assistant
+
+  backend:
+    build: ./backend
+    container_name: meeting_assistant_backend
+    environment:
+      GROQ_API_KEY: ${GROQ_API_KEY}
+      DATABASE_URL: postgresql+asyncpg://assistant_user:secure_password_123@postgres:5432/meeting_assistant
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./backend/storage:/app/storage
+      - ./backend/faiss_indexes:/app/faiss_indexes
+    networks:
+      - meeting-assistant
+
+  frontend:
+    build: ./frontend
+    container_name: meeting_assistant_frontend
+    environment:
+      NEXT_PUBLIC_API_URL: http://backend:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    networks:
+      - meeting-assistant
+
+networks:
+  meeting-assistant:
+    driver: bridge
+
+volumes:
+  postgres_data:
