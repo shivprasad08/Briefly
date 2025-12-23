@@ -42,7 +42,7 @@ meeting-assistant/
 - **RAG Framework:** LangChain
 
 ### Frontend
-- **Framework:** Next.js 14 (App Router)
+- **Framework:** Next.js 14 
 - **Language:** TypeScript
 - **Styling:** Tailwind CSS
 - **Animations:** Framer Motion
@@ -53,7 +53,7 @@ meeting-assistant/
 ## Prerequisites
 
 - Python 3.11+
-- Node.js 18+ (for frontend)
+- Node.js 18+ 
 - Docker & Docker Compose (for PostgreSQL)
 - Groq API key ([Get it here](https://console.groq.com))
 
