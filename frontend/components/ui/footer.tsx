@@ -1,4 +1,5 @@
 import React, { useState } from "react";
+import emailjs from '@emailjs/browser';
 import { FaGithub, FaLinkedin, FaTwitter } from "react-icons/fa";
 import { Mail, MapPin, Phone } from "lucide-react";
 import Link from "next/link";
@@ -51,13 +52,47 @@ export const Footer7 = ({
     setIsSubmitting(true);
     setSubmitMessage('');
 
-    // Simulate API call
-    setTimeout(() => {
-      setSubmitMessage('Thanks for reaching out! We\'ll be in touch soon.');
-      setEmail('');
-      setMessage('');
-      setIsSubmitting(false);
-    }, 1000);
+    // 1. Send message to owner
+    const ownerPromise = emailjs.send(
+      'service_gg26xhh', // Service ID
+      'template_6q7bsje', // Owner notification template
+      {
+        from_email: email,
+        message: message,
+      },
+      '-MXNfC8XuXgxDvWyo' // Public Key
+    );
+
+    // 2. Send auto-reply to user
+    const autoReplyPromise = emailjs.send(
+      'service_gg26xhh', // Service ID
+      'template_dhpncln', // Auto-reply template (correct ID)
+      {
+        to_email: email,
+        name: email.split('@')[0], // or collect name from input if available
+      },
+      '-MXNfC8XuXgxDvWyo' // Public Key
+    );
+
+    Promise.all([ownerPromise, autoReplyPromise])
+      .then(() => {
+        setSubmitMessage('Thanks for reaching out! We\'ll be in touch soon.');
+        setEmail('');
+        setMessage('');
+      })
+      .catch((error) => {
+        let errorMsg = 'Sorry, there was an error. Please try again later.';
+        if (error && error.text) {
+          errorMsg += `\nDetails: ${error.text}`;
+        } else if (error && error.message) {
+          errorMsg += `\nDetails: ${error.message}`;
+        }
+        console.error('EmailJS error:', error);
+        setSubmitMessage(errorMsg);
+      })
+      .finally(() => {
+        setIsSubmitting(false);
+      });
   };
 
   return (
@@ -134,9 +169,7 @@ export const Footer7 = ({
 
             <div className="text-center sm:text-left">
               <p className="text-lg font-medium text-white mb-4">Connect with me</p>
-              <p className="text-sm text-white/70 mb-6">
-                Interested in updates? Drop your email and message below.
-              </p>
+              
               <form onSubmit={handleSubmit} className="flex flex-col gap-3">
                 <input
                   type="email"

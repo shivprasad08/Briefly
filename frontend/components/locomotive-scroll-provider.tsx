@@ -62,13 +62,17 @@ export default function LocomotiveScrollProvider({
       });
       
       const handleResize = () => {
-        if (locomotiveScroll) {
-          locomotiveScroll.update();
+        try {
+          if (locomotiveScroll && typeof locomotiveScroll.update === 'function') {
+            locomotiveScroll.update();
+          }
+        } catch (err) {
+          console.error('LocomotiveScroll update error:', err);
         }
       };
-      
+
       window.addEventListener('resize', handleResize);
-      
+
       // Cleanup resize listener
       return () => {
         window.removeEventListener('resize', handleResize);
