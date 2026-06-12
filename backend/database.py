@@ -5,15 +5,8 @@ from sqlalchemy.orm import sessionmaker
 import os
 from pathlib import Path
 
-# Use absolute path for database to avoid working directory issues
-BASE_DIR = Path(__file__).parent
-DB_PATH = BASE_DIR / "meeting_assistant.db"
-
-# Database configuration
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    f"sqlite+aiosqlite:///{DB_PATH}"
-)
+# Import DATABASE_URL from config
+from config import DATABASE_URL
 
 # Create async engine
 engine = create_async_engine(

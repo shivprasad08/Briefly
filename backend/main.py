@@ -4,14 +4,16 @@ from pathlib import Path
 import sys
 sys.path.insert(0, str(Path(__file__).parent))
 
-from fastapi import FastAPI, Depends, UploadFile, File, HTTPException
+from fastapi import FastAPI, Depends, UploadFile, File, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
-from models import Session as DBSession, Document, ChatMessage
+from models import User, Session as DBSession, Document, ChatMessage
 from database import init_db, get_session, close_db
 from service import ingest_pdf, chat_with_documents
-from pydantic import BaseModel
+from auth import verify_password, get_password_hash, create_access_token, verify_token
+from pydantic import BaseModel, EmailStr
 from datetime import datetime
 
 
@@ -47,8 +49,65 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Security
+security = HTTPBearer()
+
+
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security), session: AsyncSession = Depends(get_session)) -> User:
+    """Dependency to get current authenticated user from JWT token."""
+    token = credentials.credentials
+    payload = verify_token(token)
+    
+    if payload is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    email: str = payload.get("email")
+    
+    # Fetch user from database
+    query = select(User).where(User.email == email)
+    result = await session.execute(query)
+    user = result.scalar_one_or_none()
+    
+    if user is None or not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User not found or inactive",
+        )
+    
+    return user
+
 
 # Request/Response models
+class SignupRequest(BaseModel):
+    email: str
+    password: str
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user_id: int
+    email: str
+
+
+class UserResponse(BaseModel):
+    id: int
+    email: str
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
 class SessionCreate(BaseModel):
     name: str
 
@@ -97,13 +156,83 @@ async def health_check():
     return {"status": "healthy"}
 
 
+@app.post("/auth/signup", response_model=TokenResponse)
+async def signup(
+    request: SignupRequest,
+    session: AsyncSession = Depends(get_session),
+):
+    """Register a new user."""
+    # Check if user already exists
+    query = select(User).where(User.email == request.email)
+    result = await session.execute(query)
+    existing_user = result.scalar_one_or_none()
+    
+    if existing_user:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Email already registered"
+        )
+    
+    # Create new user
+    hashed_password = get_password_hash(request.password)
+    user = User(email=request.email, hashed_password=hashed_password)
+    session.add(user)
+    await session.commit()
+    await session.refresh(user)
+    
+    # Generate token
+    access_token = create_access_token(data={"sub": user.email})
+    
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user_id": user.id,
+        "email": user.email,
+    }
+
+
+@app.post("/auth/login", response_model=TokenResponse)
+async def login(
+    request: LoginRequest,
+    session: AsyncSession = Depends(get_session),
+):
+    """Login user and get access token."""
+    # Find user
+    query = select(User).where(User.email == request.email)
+    result = await session.execute(query)
+    user = result.scalar_one_or_none()
+    
+    if not user or not verify_password(request.password, user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password"
+        )
+    
+    # Generate token
+    access_token = create_access_token(data={"sub": user.email})
+    
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user_id": user.id,
+        "email": user.email,
+    }
+
+
+@app.get("/auth/me", response_model=UserResponse)
+async def get_current_user_info(current_user: User = Depends(get_current_user)):
+    """Get current user information."""
+    return current_user
+
+
 @app.post("/sessions", response_model=SessionResponse)
 async def create_session(
     request: SessionCreate,
+    current_user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ):
     """Create a new session."""
-    db_session = DBSession(name=request.name)
+    db_session = DBSession(name=request.name, user_id=current_user.id)
     session.add(db_session)
     await session.commit()
     await session.refresh(db_session)
@@ -111,9 +240,12 @@ async def create_session(
 
 
 @app.get("/sessions", response_model=list[SessionResponse])
-async def list_sessions(session: AsyncSession = Depends(get_session)):
-    """Get all sessions."""
-    query = select(DBSession).order_by(DBSession.created_at.desc())
+async def list_sessions(
+    current_user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session)
+):
+    """Get all sessions for current user."""
+    query = select(DBSession).where(DBSession.user_id == current_user.id).order_by(DBSession.created_at.desc())
     result = await session.execute(query)
     sessions = result.scalars().all()
     return sessions
@@ -122,10 +254,13 @@ async def list_sessions(session: AsyncSession = Depends(get_session)):
 @app.get("/sessions/{session_id}", response_model=SessionResponse)
 async def get_session_detail(
     session_id: int,
+    current_user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ):
     """Get a specific session."""
-    query = select(DBSession).where(DBSession.id == session_id)
+    query = select(DBSession).where(
+        (DBSession.id == session_id) & (DBSession.user_id == current_user.id)
+    )
     result = await session.execute(query)
     db_session = result.scalar_one_or_none()
     
@@ -139,10 +274,13 @@ async def get_session_detail(
 async def update_session(
     session_id: int,
     request: SessionCreate,
+    current_user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ):
     """Update a session's name."""
-    query = select(DBSession).where(DBSession.id == session_id)
+    query = select(DBSession).where(
+        (DBSession.id == session_id) & (DBSession.user_id == current_user.id)
+    )
     result = await session.execute(query)
     db_session = result.scalar_one_or_none()
     
@@ -155,15 +293,40 @@ async def update_session(
     return db_session
 
 
+@app.delete("/sessions/{session_id}")
+async def delete_session(
+    session_id: int,
+    current_user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    """Delete a session."""
+    query = select(DBSession).where(
+        (DBSession.id == session_id) & (DBSession.user_id == current_user.id)
+    )
+    result = await session.execute(query)
+    db_session = result.scalar_one_or_none()
+    
+    if not db_session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    await session.delete(db_session)
+    await session.commit()
+    return {"status": "deleted"}
+
+
+
 @app.post("/sessions/{session_id}/upload")
 async def upload_document(
     session_id: int,
     file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ):
     """Upload a PDF to a session."""
-    # Validate session exists
-    query = select(DBSession).where(DBSession.id == session_id)
+    # Validate session exists and belongs to user
+    query = select(DBSession).where(
+        (DBSession.id == session_id) & (DBSession.user_id == current_user.id)
+    )
     result = await session.execute(query)
     db_session = result.scalar_one_or_none()
     
@@ -215,12 +378,23 @@ async def upload_document(
 @app.get("/sessions/{session_id}/documents", response_model=list[DocumentResponse])
 async def get_documents(
     session_id: int,
+    current_user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ):
     """Get all documents for a session."""
-    query = select(Document).where(Document.session_id == session_id).order_by(Document.upload_timestamp.desc())
+    # Verify session belongs to user
+    query = select(DBSession).where(
+        (DBSession.id == session_id) & (DBSession.user_id == current_user.id)
+    )
     result = await session.execute(query)
-    documents = result.scalars().all()
+    db_session = result.scalar_one_or_none()
+    
+    if not db_session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    doc_query = select(Document).where(Document.session_id == session_id).order_by(Document.upload_timestamp.desc())
+    doc_result = await session.execute(doc_query)
+    documents = doc_result.scalars().all()
     return documents
 
 
@@ -228,13 +402,16 @@ async def get_documents(
 async def chat(
     session_id: int,
     request: ChatRequest,
+    current_user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ):
     """Chat with documents in a session."""
     print(f"[*] Chat request - Session: {session_id}, Query: {request.query}")
     
-    # Validate session exists
-    query = select(DBSession).where(DBSession.id == session_id)
+    # Validate session exists and belongs to user
+    query = select(DBSession).where(
+        (DBSession.id == session_id) & (DBSession.user_id == current_user.id)
+    )
     result = await session.execute(query)
     db_session = result.scalar_one_or_none()
     
@@ -256,12 +433,23 @@ async def chat(
 @app.get("/sessions/{session_id}/messages", response_model=list[MessageResponse])
 async def get_messages(
     session_id: int,
+    current_user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ):
     """Get chat messages for a session."""
-    query = select(ChatMessage).where(ChatMessage.session_id == session_id).order_by(ChatMessage.timestamp.asc())
+    # Verify session belongs to user
+    query = select(DBSession).where(
+        (DBSession.id == session_id) & (DBSession.user_id == current_user.id)
+    )
     result = await session.execute(query)
-    messages = result.scalars().all()
+    db_session = result.scalar_one_or_none()
+    
+    if not db_session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    msg_query = select(ChatMessage).where(ChatMessage.session_id == session_id).order_by(ChatMessage.timestamp.asc())
+    msg_result = await session.execute(msg_query)
+    messages = msg_result.scalars().all()
     return messages
 
 

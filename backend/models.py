@@ -3,15 +3,32 @@ from typing import Optional, List
 from sqlmodel import SQLModel, Field, Relationship
 
 
+class User(SQLModel, table=True):
+    """Represents a user in the system."""
+    id: Optional[int] = Field(default=None, primary_key=True)
+    email: str = Field(unique=True, index=True)
+    hashed_password: str
+    is_active: bool = Field(default=True)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    
+    # Relationships
+    sessions: List["Session"] = Relationship(
+        back_populates="user",
+        sa_relationship_kwargs={"cascade": "all, delete-orphan"}
+    )
+
+
 class Session(SQLModel, table=True):
     """Represents a meeting session where users upload documents and chat."""
     id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: int = Field(foreign_key="user.id", index=True)
     name: str = Field(index=True)
     current_summary: Optional[str] = Field(default=None)  # Evolving summary
     faiss_index_path: Optional[str] = Field(default=None)  # Path to .index file
     created_at: datetime = Field(default_factory=datetime.utcnow)
     
     # Relationships
+    user: Optional[User] = Relationship(back_populates="sessions")
     documents: List["Document"] = Relationship(
         back_populates="session",
         sa_relationship_kwargs={"cascade": "all, delete-orphan"}
