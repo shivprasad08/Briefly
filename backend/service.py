@@ -143,11 +143,11 @@ async def get_recent_context(session_id: int, session_db: AsyncSession) -> str:
     return context if context else "No recent context."
 
 
-async def ingest_pdf(session_id: int, file_path: str, session_db: AsyncSession) -> None:
+async def ingest_pdf(session_id: int, file_path: str, session_db: AsyncSession, document_id: int) -> None:
     """
     Ingest a PDF file:
     1. Extract text
-    2. Update FAISS index
+    2. Update Database with Chunk embeddings
     3. Update session summary
     """
     # Get session
@@ -164,30 +164,36 @@ async def ingest_pdf(session_id: int, file_path: str, session_db: AsyncSession) 
     # Chunk the text
     chunks = text_splitter.split_text(text)
 
-    # Guard: if no text was extracted, fail fast to avoid empty FAISS index
+    # Guard: if no text was extracted, fail fast to avoid empty index
     if not text.strip() or not chunks:
         raise ValueError("PDF has no extractable text; please upload a PDF with text content")
     
-    # Load or create FAISS index
-    faiss_path = FAISS_INDEX_DIR / f"session_{session_id}"
+    # Import here to avoid circular imports
+    from hybrid_search import embed_chunks
+    from models import Chunk
     
-    if session.faiss_index_path and os.path.exists(faiss_path):
-        # Load existing index
-        vector_store = FAISS.load_local(str(faiss_path), get_embeddings(), allow_dangerous_deserialization=True)
-    else:
-        # Create new index with the first batch of chunks
-        vector_store = FAISS.from_texts(chunks, get_embeddings())
-        chunks = []  # already added on creation
+    # Batch embed the chunks
+    embeddings = embed_chunks(chunks)
     
-    # Add remaining chunks to the index (if any)
-    if chunks:
-        vector_store.add_texts(chunks)
+    # Create Chunk records
+    db_chunks = []
+    for idx, content in enumerate(chunks):
+        embedding = embeddings[idx] if idx < len(embeddings) else []
+        if embedding:
+            chunk = Chunk(
+                document_id=document_id,
+                content=content,
+                embedding=embedding,
+                # tsv will be populated by DB if trigger exists, or we can just leave it NULL and let migration update it
+            )
+            session_db.add(chunk)
+            db_chunks.append(chunk)
+            
+    if db_chunks:
+        await session_db.commit()
     
-    # Save updated index
-    vector_store.save_local(str(faiss_path))
-    
-    # Update session with FAISS path
-    session.faiss_index_path = str(faiss_path)
+    # Note: We keep faiss_index_path populated as a flag if needed, or we could remove it.
+    session.faiss_index_path = f"db_indexed_doc_{document_id}"
     
     # Generate summary of new PDF
     new_summary = await generate_new_summary(text)
@@ -241,20 +247,20 @@ async def chat_with_documents(
         return "Vector store not found. Please re-upload documents."
     
     try:
-        print(f"[*] Loading FAISS index from {faiss_path}")
-        vector_store = FAISS.load_local(faiss_path, get_embeddings(), allow_dangerous_deserialization=True)
-        print("[OK] FAISS index loaded")
+        # Retrieve relevant documents using hybrid search
+        print("[*] Retrieving relevant documents via hybrid search...")
+        from hybrid_search import hybrid_retrieve
+        chunks = await hybrid_retrieve(session_db, session_id, query)
         
-        # Retrieve relevant documents
-        print("[*] Retrieving relevant documents...")
-        docs = vector_store.similarity_search(query, k=5)
-        print(f"[OK] Found {len(docs)} relevant documents")
+        # Format for LLM prompt
+        docs = [{"page_content": c.content} for c in chunks]
+        print(f"[OK] Found {len(docs)} relevant chunks")
         
         if not docs:
             answer = "I couldn't find relevant information in the documents to answer your question."
         else:
             # Prepare context from documents
-            context = "\n\n".join([doc.page_content for doc in docs])
+            context = "\n\n".join([doc["page_content"] for doc in docs])
             
             # Detect format request in query
             format_instruction = ""

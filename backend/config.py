@@ -40,4 +40,13 @@ RETRIEVAL_K = 5
 # LLM Parameters
 LLM_TEMPERATURE = 0.7
 
+# Hybrid Retrieval Config (env vars with defaults)
+ENABLE_SPARSE = os.getenv("ENABLE_SPARSE", "true").lower() == "true"
+RRF_K = int(os.getenv("RRF_K", "60"))
+CANDIDATE_COUNT = int(os.getenv("CANDIDATE_COUNT", "20"))
+FINAL_TOP_N = int(os.getenv("FINAL_TOP_N", "5"))
+
+# External services
+MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
+
 print("[OK] Environment configured successfully")

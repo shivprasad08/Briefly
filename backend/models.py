@@ -1,13 +1,15 @@
 from datetime import datetime
 from typing import Optional, List
 from sqlmodel import SQLModel, Field, Relationship
+from pgvector.sqlalchemy import Vector
 
 
 class User(SQLModel, table=True):
     """Represents a user in the system."""
     id: Optional[int] = Field(default=None, primary_key=True)
     email: str = Field(unique=True, index=True)
-    hashed_password: str
+    hashed_password: Optional[str] = Field(default=None)
+    oauth_provider: str = Field(default="local")
     is_active: bool = Field(default=True)
     created_at: datetime = Field(default_factory=datetime.utcnow)
     
@@ -16,6 +18,22 @@ class User(SQLModel, table=True):
         back_populates="user",
         sa_relationship_kwargs={"cascade": "all, delete-orphan"}
     )
+    refresh_tokens: List["RefreshToken"] = Relationship(
+        back_populates="user",
+        sa_relationship_kwargs={"cascade": "all, delete-orphan"}
+    )
+
+class RefreshToken(SQLModel, table=True):
+    """Represents a refresh token for maintaining user sessions."""
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: int = Field(foreign_key="user.id", index=True)
+    token_hash: str = Field(unique=True, index=True)
+    expires_at: datetime
+    revoked: bool = Field(default=False)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    
+    # Relationship
+    user: Optional[User] = Relationship(back_populates="refresh_tokens")
 
 
 class Session(SQLModel, table=True):
@@ -46,9 +64,30 @@ class Document(SQLModel, table=True):
     filename: str
     file_path: str  # Local path where PDF is stored
     upload_timestamp: datetime = Field(default_factory=datetime.utcnow)
+    # Relationship back to session already defined above
+    session: Optional[Session] = Relationship(
+        back_populates="session",
+        sa_relationship_kwargs={"cascade": "all, delete-orphan"}
+    )
+    # Relationship to chunks
+    chunks: List["Chunk"] = Relationship(
+        back_populates="document",
+        sa_relationship_kwargs={"cascade": "all, delete-orphan"}
+    )
+
+
+class Chunk(SQLModel, table=True):
+    """Represents a chunk of text from a document."""
+    id: Optional[int] = Field(default=None, primary_key=True)
+    document_id: int = Field(foreign_key="document.id", index=True)
+    content: str
+    # Vector embedding for dense retrieval (pgvector)
+    embedding: list[float] = Field(sa_column=Vector(dim=1024))
+    # Full-text search vector for sparse retrieval
+    tsv: str = Field(default=None)
     
     # Relationship
-    session: Optional[Session] = Relationship(back_populates="documents")
+    document: Optional[Document] = Relationship(back_populates="chunks")
 
 
 class ChatMessage(SQLModel, table=True):

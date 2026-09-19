@@ -9,12 +9,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
-from models import User, Session as DBSession, Document, ChatMessage
+from models import User, Session as DBSession, Document, ChatMessage, RefreshToken
 from database import init_db, get_session, close_db
 from service import ingest_pdf, chat_with_documents
-from auth import verify_password, get_password_hash, create_access_token, verify_token
+from auth import (
+    verify_password, get_password_hash, create_access_token, verify_token,
+    create_refresh_token, hash_refresh_token, verify_refresh_token
+)
+from jose import ExpiredSignatureError, JWTError
 from pydantic import BaseModel, EmailStr
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+from google.oauth2 import id_token
+from google.auth.transport import requests as google_requests
 
 
 # Lifespan startup
@@ -56,9 +62,15 @@ security = HTTPBearer()
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security), session: AsyncSession = Depends(get_session)) -> User:
     """Dependency to get current authenticated user from JWT token."""
     token = credentials.credentials
-    payload = verify_token(token)
-    
-    if payload is None:
+    try:
+        payload = verify_token(token)
+    except ExpiredSignatureError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token has expired",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    except JWTError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid authentication credentials",
@@ -91,10 +103,17 @@ class LoginRequest(BaseModel):
     email: str
     password: str
 
+class RefreshRequest(BaseModel):
+    refresh_token: str
+
+class GoogleAuthRequest(BaseModel):
+    id_token: str
+
 
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
+    refresh_token: str
     user_id: int
     email: str
 
@@ -149,6 +168,26 @@ class MessageResponse(BaseModel):
         from_attributes = True
 
 
+from fastapi import Request
+
+# Basic Rate Limiting for Auth
+auth_rate_limits = {}
+
+def rate_limit(request: Request):
+    """Simple in-memory rate limiter for auth endpoints (max 5 requests per minute per IP)."""
+    ip = request.client.host
+    now = datetime.now()
+    if ip not in auth_rate_limits:
+        auth_rate_limits[ip] = []
+        
+    # Clean up old requests (older than 1 minute)
+    auth_rate_limits[ip] = [t for t in auth_rate_limits[ip] if now - t < timedelta(minutes=1)]
+    
+    if len(auth_rate_limits[ip]) >= 5:
+        raise HTTPException(status_code=429, detail="Too many requests. Please try again later.")
+        
+    auth_rate_limits[ip].append(now)
+
 # Routes
 @app.get("/health")
 async def health_check():
@@ -156,12 +195,19 @@ async def health_check():
     return {"status": "healthy"}
 
 
-@app.post("/auth/signup", response_model=TokenResponse)
+@app.post("/auth/signup", response_model=TokenResponse, dependencies=[Depends(rate_limit)])
 async def signup(
     request: SignupRequest,
     session: AsyncSession = Depends(get_session),
 ):
     """Register a new user."""
+    # Validate password length
+    if len(request.password) < 8:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Password must be at least 8 characters long"
+        )
+        
     # Check if user already exists
     query = select(User).where(User.email == request.email)
     result = await session.execute(query)
@@ -175,28 +221,40 @@ async def signup(
     
     # Create new user
     hashed_password = get_password_hash(request.password)
-    user = User(email=request.email, hashed_password=hashed_password)
+    user = User(email=request.email, hashed_password=hashed_password, oauth_provider="local")
     session.add(user)
     await session.commit()
     await session.refresh(user)
     
-    # Generate token
+    # Generate tokens
     access_token = create_access_token(data={"sub": user.email})
+    refresh_token = create_refresh_token()
+    
+    # Store refresh token
+    expires_at = datetime.now(timezone.utc) + timedelta(days=7)
+    db_refresh_token = RefreshToken(
+        user_id=user.id,
+        token_hash=hash_refresh_token(refresh_token),
+        expires_at=expires_at
+    )
+    session.add(db_refresh_token)
+    await session.commit()
     
     return {
         "access_token": access_token,
         "token_type": "bearer",
+        "refresh_token": refresh_token,
         "user_id": user.id,
         "email": user.email,
     }
 
 
-@app.post("/auth/login", response_model=TokenResponse)
+@app.post("/auth/login", response_model=TokenResponse, dependencies=[Depends(rate_limit)])
 async def login(
     request: LoginRequest,
     session: AsyncSession = Depends(get_session),
 ):
-    """Login user and get access token."""
+    """Login user and get access and refresh tokens."""
     # Find user
     query = select(User).where(User.email == request.email)
     result = await session.execute(query)
@@ -208,16 +266,154 @@ async def login(
             detail="Invalid email or password"
         )
     
-    # Generate token
+    # Generate tokens
     access_token = create_access_token(data={"sub": user.email})
+    refresh_token = create_refresh_token()
+    
+    # Store refresh token
+    expires_at = datetime.now(timezone.utc) + timedelta(days=7)
+    db_refresh_token = RefreshToken(
+        user_id=user.id,
+        token_hash=hash_refresh_token(refresh_token),
+        expires_at=expires_at
+    )
+    session.add(db_refresh_token)
+    await session.commit()
     
     return {
         "access_token": access_token,
         "token_type": "bearer",
+        "refresh_token": refresh_token,
         "user_id": user.id,
         "email": user.email,
     }
 
+
+@app.post("/auth/refresh", response_model=TokenResponse)
+async def refresh_token_route(
+    request: RefreshRequest,
+    session: AsyncSession = Depends(get_session),
+):
+    """Refresh access token and rotate refresh token."""
+    # Hash the provided token to look it up
+    hashed = hash_refresh_token(request.refresh_token)
+    
+    query = select(RefreshToken).where(RefreshToken.token_hash == hashed)
+    result = await session.execute(query)
+    db_token = result.scalar_one_or_none()
+    
+    if not db_token:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
+    if db_token.revoked:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token has been revoked")
+    if db_token.expires_at.replace(tzinfo=timezone.utc) < datetime.now(timezone.utc):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token expired")
+        
+    # Get user
+    query_user = select(User).where(User.id == db_token.user_id)
+    result_user = await session.execute(query_user)
+    user = result_user.scalar_one_or_none()
+    
+    if not user or not user.is_active:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found or inactive")
+        
+    # Revoke old token
+    db_token.revoked = True
+    session.add(db_token)
+    
+    # Issue new tokens
+    new_access = create_access_token(data={"sub": user.email})
+    new_refresh = create_refresh_token()
+    
+    expires_at = datetime.now(timezone.utc) + timedelta(days=7)
+    new_db_token = RefreshToken(
+        user_id=user.id,
+        token_hash=hash_refresh_token(new_refresh),
+        expires_at=expires_at
+    )
+    session.add(new_db_token)
+    await session.commit()
+    
+    return {
+        "access_token": new_access,
+        "token_type": "bearer",
+        "refresh_token": new_refresh,
+        "user_id": user.id,
+        "email": user.email,
+    }
+
+
+@app.post("/auth/logout")
+async def logout(
+    request: RefreshRequest,
+    session: AsyncSession = Depends(get_session),
+):
+    """Logout user by revoking refresh token."""
+    hashed = hash_refresh_token(request.refresh_token)
+    query = select(RefreshToken).where(RefreshToken.token_hash == hashed)
+    result = await session.execute(query)
+    db_token = result.scalar_one_or_none()
+    
+    if db_token and not db_token.revoked:
+        db_token.revoked = True
+        session.add(db_token)
+        await session.commit()
+        
+    return {"status": "logged out"}
+
+
+@app.post("/auth/google", response_model=TokenResponse)
+async def google_auth(
+    request: GoogleAuthRequest,
+    session: AsyncSession = Depends(get_session),
+):
+    """Authenticate with Google ID token."""
+    client_id = os.getenv("GOOGLE_CLIENT_ID")
+    if not client_id:
+        raise HTTPException(status_code=500, detail="Google Auth not configured")
+        
+    try:
+        idinfo = id_token.verify_oauth2_token(
+            request.id_token, google_requests.Request(), client_id
+        )
+        email = idinfo.get("email")
+        if not email:
+            raise ValueError("No email in token")
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=f"Invalid Google token: {e}")
+        
+    # Find user or create
+    query = select(User).where(User.email == email)
+    result = await session.execute(query)
+    user = result.scalar_one_or_none()
+    
+    if not user:
+        # Create new google user
+        user = User(email=email, oauth_provider="google")
+        session.add(user)
+        await session.commit()
+        await session.refresh(user)
+        
+    # Issue tokens
+    access_token = create_access_token(data={"sub": user.email})
+    refresh_token = create_refresh_token()
+    
+    expires_at = datetime.now(timezone.utc) + timedelta(days=7)
+    db_refresh_token = RefreshToken(
+        user_id=user.id,
+        token_hash=hash_refresh_token(refresh_token),
+        expires_at=expires_at
+    )
+    session.add(db_refresh_token)
+    await session.commit()
+    
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "refresh_token": refresh_token,
+        "user_id": user.id,
+        "email": user.email,
+    }
 
 @app.get("/auth/me", response_model=UserResponse)
 async def get_current_user_info(current_user: User = Depends(get_current_user)):
@@ -356,9 +552,9 @@ async def upload_document(
     session.add(document)
     await session.commit()
     
-    # Ingest PDF (update FAISS and summary)
+    # Ingest PDF (update FAISS/DB and summary)
     try:
-        await ingest_pdf(session_id, str(file_path), session)
+        await ingest_pdf(session_id, str(file_path), session, document.id)
     except Exception as e:
         # Cleanup file on error
         if file_path.exists():
