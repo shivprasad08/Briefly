@@ -1,7 +1,7 @@
 import React from 'react';
-import { motion } from 'framer-motion';
 
 interface ButtonProps extends React.ButtonHTMLAttributes<HTMLButtonElement> {
+  className?: string;
   variant?: 'default' | 'outline' | 'ghost' | 'destructive';
   size?: 'sm' | 'md' | 'lg';
 }
@@ -24,11 +24,9 @@ export const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(
     };
 
     return (
-      <motion.button
+      <button
         ref={ref}
         className={`${baseStyles} ${variants[variant]} ${sizes[size]} ${className}`}
-        whileHover={{ scale: 1.02 }}
-        whileTap={{ scale: 0.98 }}
         {...props}
       />
     );

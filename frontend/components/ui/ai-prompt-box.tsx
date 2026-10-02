@@ -18,8 +18,16 @@ const MotionSpan = motion.span as any;
 const cn = (...classes: Array<string | undefined | null | false>) => classes.filter(Boolean).join(' ');
 
 // Minimal SpeechRecognition typings to avoid lib issues across browsers
-type SpeechRecognitionErrorEvent = globalThis.SpeechRecognitionErrorEvent;
-type SpeechRecognitionEvent = globalThis.SpeechRecognitionEvent;
+type SpeechRecognitionErrorEvent = {
+  error?: string;
+};
+type SpeechRecognitionEvent = {
+  resultIndex: number;
+  results: {
+    length: number;
+    [index: number]: [{ transcript: string }];
+  };
+};
 
 type SpeechRecognition = {
   start: () => void;

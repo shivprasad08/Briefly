@@ -9,7 +9,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
-from models import User, Session as DBSession, Document, ChatMessage, RefreshToken
+from models import (
+    User,
+    Session as DBSession,
+    Document,
+    ChatMessage,
+    RefreshToken,
+    Conversation,
+    ConversationMessage,
+    ConversationMessageRole,
+)
 from database import init_db, get_session, close_db
 from service import ingest_pdf, chat_with_documents
 from auth import (
@@ -19,6 +28,7 @@ from auth import (
 from jose import ExpiredSignatureError, JWTError
 from pydantic import BaseModel, EmailStr
 from datetime import datetime, timezone, timedelta
+from uuid import UUID
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
 
@@ -143,10 +153,12 @@ class SessionResponse(BaseModel):
 
 class ChatRequest(BaseModel):
     query: str
+    conversation_id: str | None = None
 
 
 class ChatResponse(BaseModel):
     response: str
+    conversation_id: str
 
 
 class DocumentResponse(BaseModel):
@@ -166,6 +178,73 @@ class MessageResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class ConversationCreate(BaseModel):
+    title: str | None = None
+
+
+class ConversationResponse(BaseModel):
+    id: str
+    title: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class ConversationMessageCreate(BaseModel):
+    role: ConversationMessageRole
+    content: str
+    sources: list[dict] | None = None
+
+
+class ConversationMessageResponse(BaseModel):
+    id: str
+    conversation_id: str
+    role: ConversationMessageRole
+    content: str
+    sources: list[dict] | None
+    created_at: datetime
+
+
+class ConversationDetailResponse(ConversationResponse):
+    messages: list[ConversationMessageResponse]
+
+
+def conversation_response(conversation: Conversation) -> ConversationResponse:
+    return ConversationResponse(
+        id=str(conversation.id),
+        title=conversation.title,
+        created_at=conversation.created_at,
+        updated_at=conversation.updated_at,
+    )
+
+
+async def get_owned_conversation(
+    conversation_id: str,
+    current_user: User,
+    session: AsyncSession,
+) -> Conversation:
+    """Load a conversation and distinguish missing resources from ownership failures."""
+    try:
+        conversation_uuid = UUID(conversation_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    result = await session.execute(
+        select(Conversation).where(Conversation.id == conversation_uuid)
+    )
+    conversation = result.scalar_one_or_none()
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    if conversation.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Conversation access denied")
+    return conversation
+
+
+def conversation_title(content: str) -> str:
+    words = content.split()
+    title = " ".join(words[:6]).strip()
+    return title[:80] or "New conversation"
 
 
 from fastapi import Request
@@ -421,6 +500,120 @@ async def get_current_user_info(current_user: User = Depends(get_current_user)):
     return current_user
 
 
+@app.post("/conversations", response_model=ConversationResponse)
+async def create_conversation(
+    request: ConversationCreate,
+    current_user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    conversation = Conversation(user_id=current_user.id, title=request.title)
+    session.add(conversation)
+    await session.commit()
+    await session.refresh(conversation)
+    return conversation_response(conversation)
+
+
+@app.get("/conversations", response_model=list[ConversationResponse])
+async def list_conversations(
+    current_user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    result = await session.execute(
+        select(Conversation)
+        .where(Conversation.user_id == current_user.id)
+        .order_by(Conversation.updated_at.desc())
+    )
+    return [conversation_response(item) for item in result.scalars().all()]
+
+
+@app.get("/conversations/{conversation_id}", response_model=ConversationDetailResponse)
+async def get_conversation(
+    conversation_id: str,
+    current_user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    conversation = await get_owned_conversation(conversation_id, current_user, session)
+    messages_result = await session.execute(
+        select(ConversationMessage)
+        .where(ConversationMessage.conversation_id == conversation.id)
+        .order_by(ConversationMessage.created_at.asc(), ConversationMessage.id.asc())
+    )
+    return {
+        "id": str(conversation.id),
+        "title": conversation.title,
+        "created_at": conversation.created_at,
+        "updated_at": conversation.updated_at,
+        "messages": [
+            {
+                "id": str(message.id),
+                "conversation_id": str(message.conversation_id),
+                "role": message.role,
+                "content": message.content,
+                "sources": message.sources,
+                "created_at": message.created_at,
+            }
+            for message in messages_result.scalars().all()
+        ],
+    }
+
+
+@app.patch("/conversations/{conversation_id}", response_model=ConversationResponse)
+async def rename_conversation(
+    conversation_id: str,
+    request: ConversationCreate,
+    current_user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    conversation = await get_owned_conversation(conversation_id, current_user, session)
+    conversation.title = request.title.strip() if request.title else None
+    conversation.updated_at = datetime.utcnow()
+    await session.commit()
+    await session.refresh(conversation)
+    return conversation_response(conversation)
+
+
+@app.post("/conversations/{conversation_id}/messages", response_model=ConversationMessageResponse)
+async def append_conversation_message(
+    conversation_id: str,
+    request: ConversationMessageCreate,
+    current_user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    conversation = await get_owned_conversation(conversation_id, current_user, session)
+    message = ConversationMessage(
+        conversation_id=conversation.id,
+        role=request.role,
+        content=request.content,
+        sources=request.sources,
+    )
+    session.add(message)
+    if conversation.title is None and request.role == ConversationMessageRole.USER:
+        conversation.title = conversation_title(request.content)
+    conversation.updated_at = datetime.utcnow()
+    await session.commit()
+    await session.refresh(message)
+    return {
+        "id": str(message.id),
+        "conversation_id": str(message.conversation_id),
+        "role": message.role,
+        "content": message.content,
+        "sources": message.sources,
+        "created_at": message.created_at,
+    }
+
+
+@app.delete("/conversations/{conversation_id}")
+async def delete_conversation(
+    conversation_id: str,
+    current_user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    conversation = await get_owned_conversation(conversation_id, current_user, session)
+    await session.delete(conversation)
+    await session.commit()
+    return {"status": "deleted"}
+
+
 @app.post("/sessions", response_model=SessionResponse)
 async def create_session(
     request: SessionCreate,
@@ -615,10 +808,22 @@ async def chat(
         raise HTTPException(status_code=404, detail="Session not found")
     
     try:
+        conversation_uuid = None
+        if request.conversation_id:
+            conversation = await get_owned_conversation(
+                request.conversation_id, current_user, session
+            )
+            conversation_uuid = conversation.id
         print("[*] Calling chat_with_documents...")
-        response = await chat_with_documents(session_id, request.query, session)
+        response, conversation_id = await chat_with_documents(
+            session_id,
+            request.query,
+            session,
+            current_user.id,
+            conversation_uuid,
+        )
         print(f"[OK] Chat response generated: {response[:100]}...")
-        return {"response": response}
+        return {"response": response, "conversation_id": str(conversation_id)}
     except Exception as e:
         import traceback
         print(f"[!] Chat error: {str(e)}")

@@ -12,7 +12,14 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent))
 
 from database import init_db
-from models import User, Session, Document, ChatMessage  # Import all models
+from models import (  # Import all models so SQLModel metadata includes every table
+    User,
+    Session,
+    Document,
+    ChatMessage,
+    Conversation,
+    ConversationMessage,
+)
 
 
 async def main():
@@ -25,6 +32,8 @@ async def main():
         print("   - Session")
         print("   - Document")
         print("   - ChatMessage")
+        print("   - Conversation")
+        print("   - ConversationMessage")
     except Exception as e:
         print(f"❌ Database initialization failed: {e}")
         raise

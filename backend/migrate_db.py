@@ -6,6 +6,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from sqlalchemy import text
 from database import engine
+import models  # noqa: F401 - register all SQLModel tables before create_all
 
 async def run_migration():
     print("🔄 Running database migration for hybrid search...")
@@ -35,6 +36,16 @@ async def run_migration():
             # But just in case, we can import SQLModel and create_all
             from sqlmodel import SQLModel
             await conn.run_sync(SQLModel.metadata.create_all)
+
+            # Conversation history is user-scoped and ordered by these indexes.
+            await conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_messages_conversation_id "
+                "ON messages (conversation_id);"
+            ))
+            await conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_conversations_user_id "
+                "ON conversations (user_id);"
+            ))
             
             print("✅ Migration completed successfully!")
         except Exception as e:

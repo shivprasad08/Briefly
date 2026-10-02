@@ -1,0 +1,73 @@
+{
+  "info": {
+    "name": "Briefly Conversations",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://localhost:8000" },
+    { "key": "token", "value": "" },
+    { "key": "conversationId", "value": "" }
+  ],
+  "item": [
+    {
+      "name": "Create conversation",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Authorization", "value": "Bearer {{token}}" },
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "url": "{{baseUrl}}/conversations",
+        "body": { "mode": "raw", "raw": "{\n  \"title\": null\n}" }
+      }
+    },
+    {
+      "name": "List conversations",
+      "request": {
+        "method": "GET",
+        "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
+        "url": "{{baseUrl}}/conversations"
+      }
+    },
+    {
+      "name": "Get conversation history",
+      "request": {
+        "method": "GET",
+        "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
+        "url": "{{baseUrl}}/conversations/{{conversationId}}"
+      }
+    },
+    {
+      "name": "Append message",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Authorization", "value": "Bearer {{token}}" },
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "url": "{{baseUrl}}/conversations/{{conversationId}}/messages",
+        "body": { "mode": "raw", "raw": "{\n  \"role\": \"user\",\n  \"content\": \"What are the key decisions?\",\n  \"sources\": null\n}" }
+      }
+    },
+    {
+      "name": "Rename conversation",
+      "request": {
+        "method": "PATCH",
+        "header": [
+          { "key": "Authorization", "value": "Bearer {{token}}" },
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "url": "{{baseUrl}}/conversations/{{conversationId}}",
+        "body": { "mode": "raw", "raw": "{\n  \"title\": \"Quarterly review\"\n}" }
+      }
+    },
+    {
+      "name": "Delete conversation",
+      "request": {
+        "method": "DELETE",
+        "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
+        "url": "{{baseUrl}}/conversations/{{conversationId}}"
+      }
+    }
+  ]
+}

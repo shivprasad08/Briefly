@@ -2,6 +2,9 @@
 
 import { motion } from "framer-motion"
 
+const MotionDiv = motion.div as any
+const MotionSpan = motion.span as any
+
 export function Typewriter({ text }: { text: string }) {
   const words = text.split(" ")
 
@@ -19,17 +22,17 @@ export function Typewriter({ text }: { text: string }) {
   }
 
   return (
-    <motion.div 
+    <MotionDiv
       variants={container}
       initial="hidden"
       animate="visible"
       className="inline-block"
     >
       {words.map((word, index) => (
-        <motion.span key={index} variants={child} className="mr-1">
+        <MotionSpan key={index} variants={child} className="mr-1">
           {word}
-        </motion.span>
+        </MotionSpan>
       ))}
-    </motion.div>
+    </MotionDiv>
   )
 }

@@ -5,6 +5,14 @@ import { useRouter } from 'next/navigation';
 import { NotebookCard } from '@/components/ui/notebook-card';
 import { store, Notebook } from '@/lib/store';
 import { Settings, User, X } from 'lucide-react';
+import {
+  ConversationSummary,
+  createConversation,
+  deleteConversation,
+  hasConversationAuth,
+  listConversations,
+  renameConversation,
+} from '@/lib/conversations';
 
 export default function NotebookGallery() {
   const router = useRouter();
@@ -12,15 +20,29 @@ export default function NotebookGallery() {
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [apiKey, setApiKey] = useState('');
   const [isMounted, setIsMounted] = useState(false);
+  const [conversations, setConversations] = useState<ConversationSummary[]>([]);
+  const [usesServerHistory, setUsesServerHistory] = useState(false);
 
   useEffect(() => {
     setIsMounted(true);
     setNotebooks(store.getNotebooks());
+    if (hasConversationAuth()) {
+      setUsesServerHistory(true);
+      listConversations()
+        .then(setConversations)
+        .catch(() => setUsesServerHistory(false));
+    }
     const storedKey = localStorage.getItem('anthropic_api_key');
     if (storedKey) setApiKey(storedKey);
   }, []);
 
-  const handleCreateNotebook = () => {
+  const handleCreateNotebook = async () => {
+    if (usesServerHistory) {
+      const conversation = await createConversation();
+      setConversations((current) => [conversation, ...current]);
+      router.push(`/notebook/${conversation.id}`);
+      return;
+    }
     const title = prompt("Enter a title for the new notebook:");
     if (title !== null) {
       const newNotebook = store.createNotebook(title || 'Untitled Notebook');
@@ -29,14 +51,24 @@ export default function NotebookGallery() {
     }
   };
 
-  const handleDelete = (id: string) => {
+  const handleDelete = async (id: string) => {
     if (confirm("Are you sure you want to delete this notebook?")) {
+      if (usesServerHistory) {
+        await deleteConversation(id);
+        setConversations((current) => current.filter((item) => item.id !== id));
+        return;
+      }
       store.deleteNotebook(id);
       setNotebooks(store.getNotebooks());
     }
   };
 
-  const handleRename = (id: string, newTitle: string) => {
+  const handleRename = async (id: string, newTitle: string) => {
+    if (usesServerHistory) {
+      const updated = await renameConversation(id, newTitle);
+      setConversations((current) => current.map((item) => item.id === id ? updated : item));
+      return;
+    }
     store.updateNotebook(id, { title: newTitle });
     setNotebooks(store.getNotebooks());
   };
@@ -76,20 +108,31 @@ export default function NotebookGallery() {
       <main className="max-w-7xl mx-auto px-6 py-12">
         <h2 className="text-3xl font-bold mb-8 tracking-tight">Recent notebooks</h2>
         
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
-          <NotebookCard 
-            isCreateCard={true} 
-            onCreate={handleCreateNotebook} 
-          />
-          {notebooks.map((notebook) => (
-            <NotebookCard 
-              key={notebook.id}
-              notebook={notebook}
-              onDelete={handleDelete}
-              onRename={handleRename}
-            />
-          ))}
-        </div>
+        {usesServerHistory ? (
+          <div className="space-y-3 max-w-3xl">
+            <button onClick={handleCreateNotebook} className="w-full border border-dashed border-white/20 rounded-xl p-5 text-left hover:bg-white/5">
+              <span className="font-semibold">New chat</span>
+              <span className="block text-sm text-neutral-400 mt-1">Start a fresh conversation</span>
+            </button>
+            {conversations.map((conversation) => (
+              <div key={conversation.id} className="flex items-center justify-between border border-white/10 rounded-xl p-4 hover:bg-white/5">
+                <button onClick={() => router.push(`/notebook/${conversation.id}`)} className="text-left min-w-0">
+                  <span className="block font-semibold truncate">{conversation.title || 'New conversation'}</span>
+                  <span className="block text-xs text-neutral-400 mt-1">{new Date(conversation.updated_at).toLocaleString()}</span>
+                </button>
+                <button onClick={() => handleDelete(conversation.id)} className="text-xs text-neutral-400 hover:text-red-300">Delete</button>
+              </div>
+            ))}
+            {conversations.length === 0 && <p className="text-sm text-neutral-400">No conversations yet.</p>}
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
+            <NotebookCard isCreateCard={true} onCreate={handleCreateNotebook} />
+            {notebooks.map((notebook) => (
+              <NotebookCard key={notebook.id} notebook={notebook} onDelete={handleDelete} onRename={handleRename} />
+            ))}
+          </div>
+        )}
       </main>
 
       {/* Settings Modal */}

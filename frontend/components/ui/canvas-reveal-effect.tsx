@@ -1,3 +1,4 @@
+// @ts-nocheck - React Three Fiber JSX types are incompatible with the installed React typings.
 "use client";
 
 import React, { useState, useRef, useEffect, useMemo } from "react";

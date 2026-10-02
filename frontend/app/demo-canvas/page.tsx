@@ -1,17 +1,11 @@
 'use client';
 
-import { useEffect } from 'react';
 import Link from 'next/link';
 import { ArrowRight, Plus, Shapes } from 'lucide-react';
 
-import { renderCanvas } from '@/components/ui/canvas';
 import { Button } from '@/components/ui/button';
 
 export default function DemoCanvas() {
-  useEffect(() => {
-    renderCanvas();
-  }, []);
-
   return (
     <section id="home" className="relative">
       <div className="animation-delay-8 animate-fadeIn mt-20 flex flex-col items-center justify-center px-4 text-center md:mt-20">

@@ -2,6 +2,8 @@ import os
 import shutil
 from typing import Optional, List
 from pathlib import Path
+from uuid import UUID
+from datetime import datetime
 import faiss
 import numpy as np
 from pypdf import PdfReader
@@ -13,7 +15,14 @@ from langchain_core.prompts import PromptTemplate
 from langchain_community.vectorstores import FAISS
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select, Session as SQLSession
-from models import Session, Document, ChatMessage
+from models import (
+    Session,
+    Document,
+    ChatMessage,
+    Conversation,
+    ConversationMessage,
+    ConversationMessageRole,
+)
 
 
 # Lazy-load embeddings to avoid slow initialization at import time
@@ -220,7 +229,9 @@ async def chat_with_documents(
     session_id: int,
     query: str,
     session_db: AsyncSession,
-) -> str:
+    user_id: Optional[int] = None,
+    conversation_id: Optional[UUID] = None,
+) -> tuple[str, UUID]:
     """
     Chat with documents using RAG:
     1. Load FAISS index
@@ -231,6 +242,25 @@ async def chat_with_documents(
     """
     print(f"[*] chat_with_documents called for session {session_id}, query: '{query}'")
     
+    if user_id is None:
+        raise ValueError("user_id is required to persist a conversation")
+
+    conversation = None
+    if conversation_id is not None:
+        conversation_result = await session_db.execute(
+            select(Conversation).where(
+                (Conversation.id == conversation_id)
+                & (Conversation.user_id == user_id)
+            )
+        )
+        conversation = conversation_result.scalar_one_or_none()
+        if conversation is None:
+            raise ValueError("Conversation not found")
+    else:
+        conversation = Conversation(user_id=user_id)
+        session_db.add(conversation)
+        await session_db.flush()
+
     # Get session
     query_obj = select(Session).where(Session.id == session_id)
     result = await session_db.execute(query_obj)
@@ -238,13 +268,27 @@ async def chat_with_documents(
     
     if not session or not session.faiss_index_path:
         print("[!] No FAISS index found")
-        return "No documents uploaded yet. Please upload PDFs first."
+        answer = "No documents uploaded yet. Please upload PDFs first."
+        session_db.add(ConversationMessage(conversation_id=conversation.id, role=ConversationMessageRole.USER, content=query))
+        session_db.add(ConversationMessage(conversation_id=conversation.id, role=ConversationMessageRole.ASSISTANT, content=answer))
+        if conversation.title is None:
+            conversation.title = " ".join(query.split()[:6])[:80] or "New conversation"
+        conversation.updated_at = datetime.utcnow()
+        await session_db.commit()
+        return answer, conversation.id
     
     # Load FAISS index
     faiss_path = session.faiss_index_path
     if not os.path.exists(faiss_path):
         print(f"[!] FAISS path not found: {faiss_path}")
-        return "Vector store not found. Please re-upload documents."
+        answer = "Vector store not found. Please re-upload documents."
+        session_db.add(ConversationMessage(conversation_id=conversation.id, role=ConversationMessageRole.USER, content=query))
+        session_db.add(ConversationMessage(conversation_id=conversation.id, role=ConversationMessageRole.ASSISTANT, content=answer))
+        if conversation.title is None:
+            conversation.title = " ".join(query.split()[:6])[:80] or "New conversation"
+        conversation.updated_at = datetime.utcnow()
+        await session_db.commit()
+        return answer, conversation.id
     
     try:
         # Retrieve relevant documents using hybrid search
@@ -262,33 +306,33 @@ async def chat_with_documents(
             # Prepare context from documents
             context = "\n\n".join([doc["page_content"] for doc in docs])
             
-            # Detect format request in query
-            format_instruction = ""
             query_lower = query.lower()
-            
-            if "table" in query_lower:
-                format_instruction = """\n\nIMPORTANT: Format your answer as a proper markdown table. Use this exact format:
-| Column Header 1 | Column Header 2 | Column Header 3 |
-|---|---|---|
-| Row 1 Col 1 | Row 1 Col 2 | Row 1 Col 3 |
-| Row 2 Col 1 | Row 2 Col 2 | Row 2 Col 3 |
+            format_instruction = """
 
-Requirements:
-- First row must be headers with | separators
-- Second row must have |---|---|---| (dashes for alignment)
-- Each subsequent row must have values separated by |
-- Use | at the start and end of each row
-- Do NOT add any text before or after the table"""
+IMPORTANT formatting rules:
+- Use GitHub-flavored Markdown with ## headings and bullet lists.
+- Do not write paragraphs.
+- Never summarize a paper as one Section/Content table.
+- If you use a table (metrics only), each row must be on its own line with a header and |---|---| separator."""
+
+            if "table" in query_lower:
+                format_instruction = """
+
+IMPORTANT: Include a proper markdown table (each row on its own line):
+| Column Header 1 | Column Header 2 |
+|---|---|
+| Row 1 Col 1 | Row 1 Col 2 |
+
+Also use headings and bullets around the table. Do not put the table on one line."""
             elif "bullet" in query_lower or "list" in query_lower:
-                format_instruction = "\n\nIMPORTANT: Format your answer as a bullet-point list."
+                format_instruction = "\n\nIMPORTANT: Format your answer as a bullet-point list under short headings."
             elif "paragraph" in query_lower or "prose" in query_lower:
                 format_instruction = "\n\nIMPORTANT: Format your answer as one cohesive paragraph."
             elif "detail" in query_lower or "detailed" in query_lower or "comprehensive" in query_lower:
-                format_instruction = "\n\nIMPORTANT: Provide a detailed and comprehensive answer with explanations, examples, and nuances."
+                format_instruction = "\n\nIMPORTANT: Provide a detailed answer using headings, bullets, and a table only if it helps scan the facts."
             elif "brief" in query_lower or "concise" in query_lower or "short" in query_lower:
-                format_instruction = "\n\nIMPORTANT: Keep your answer brief and concise, maximum 2-3 sentences."
+                format_instruction = "\n\nIMPORTANT: Keep your answer brief: a heading plus 3-5 bullets."
             elif "lines" in query_lower:
-                # Extract number of lines if specified (e.g., "in 2 lines", "in 5 lines")
                 import re
                 match = re.search(r'(\d+)\s+lines?', query_lower)
                 if match:
@@ -317,18 +361,38 @@ Answer:"""
             answer = response.content if hasattr(response, 'content') else str(response)
             print(f"[OK] Response received: {answer[:100]}...")
         
-        # Save user message
-        user_msg = ChatMessage(session_id=session_id, role="user", content=query)
-        session_db.add(user_msg)
-        
-        # Save assistant message
-        assistant_msg = ChatMessage(session_id=session_id, role="assistant", content=answer)
-        session_db.add(assistant_msg)
+        sources = [
+            {
+                "chunk_id": str(chunk.id),
+                "document_id": chunk.document_id,
+            }
+            for chunk in chunks
+        ]
+
+        session_db.add(
+            ConversationMessage(
+                conversation_id=conversation.id,
+                role=ConversationMessageRole.USER,
+                content=query,
+            )
+        )
+        session_db.add(
+            ConversationMessage(
+                conversation_id=conversation.id,
+                role=ConversationMessageRole.ASSISTANT,
+                content=answer,
+                sources=sources or None,
+            )
+        )
+        if conversation.title is None:
+            conversation.title = " ".join(query.split()[:6])[:80] or "New conversation"
+        conversation.updated_at = datetime.utcnow()
+        session_db.add(conversation)
         
         await session_db.commit()
         print("[OK] Messages saved to database")
         
-        return answer
+        return answer, conversation.id
         
     except Exception as e:
         import traceback

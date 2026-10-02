@@ -5,8 +5,13 @@ import { useRouter } from 'next/navigation';
 import { Notebook, store, Source, ChatMessage } from '@/lib/store';
 import { extractTextFromPdf } from '@/lib/pdf-extractor';
 import { v4 as uuidv4 } from 'uuid';
-import ReactMarkdown from 'react-markdown';
+import { MarkdownContent } from '@/components/MarkdownContent';
 import { ArrowLeft, Settings, User, Plus, FileText, Upload, Send, Paperclip, Globe, Sliders, Mic, File, Info, Trash2, CheckSquare, Search } from 'lucide-react';
+import {
+  appendConversationMessage,
+  getConversation,
+  hasConversationAuth,
+} from '@/lib/conversations';
 
 export default function NotebookDetail({ params }: { params: { id: string } }) {
   const router = useRouter();
@@ -15,16 +20,50 @@ export default function NotebookDetail({ params }: { params: { id: string } }) {
   const [chatInput, setChatInput] = useState('');
   const [isGenerating, setIsGenerating] = useState(false);
   const [isSummarizing, setIsSummarizing] = useState(false);
+  const [serverConversation, setServerConversation] = useState(false);
   const chatEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    setIsMounted(true);
-    const n = store.getNotebook(params.id);
-    if (!n) {
-      router.push('/');
-    } else {
-      setNotebook(n);
-    }
+    let active = true;
+    const loadNotebook = async () => {
+      setIsMounted(true);
+      if (hasConversationAuth()) {
+        try {
+          const conversation = await getConversation(params.id);
+          if (!active) return;
+          const localNotebook = store.getNotebook(params.id);
+          setServerConversation(true);
+          setNotebook({
+            id: conversation.id,
+            title: conversation.title || 'New conversation',
+            icon: localNotebook?.icon || '💬',
+            color: localNotebook?.color || '#1e3a8a',
+            createdAt: conversation.created_at,
+            sources: localNotebook?.sources || [],
+            chatHistory: conversation.messages.map((message) => ({
+              role: message.role,
+              content: message.content,
+              timestamp: message.created_at,
+              sources: message.sources || undefined,
+            })),
+            summary: (() => {
+              const assistantMessages = conversation.messages.filter((message) => message.role === 'assistant');
+              return assistantMessages[assistantMessages.length - 1]?.content || '';
+            })(),
+          });
+          return;
+        } catch (error) {
+          console.error('Failed to load conversation', error);
+        }
+      }
+
+      const localNotebook = store.getNotebook(params.id);
+      if (!active) return;
+      if (!localNotebook) router.push('/');
+      else setNotebook(localNotebook);
+    };
+    loadNotebook();
+    return () => { active = false; };
   }, [params.id, router]);
 
   useEffect(() => {
@@ -33,6 +72,10 @@ export default function NotebookDetail({ params }: { params: { id: string } }) {
 
   const updateNotebookState = (updates: Partial<Notebook>) => {
     if (!notebook) return;
+    if (serverConversation) {
+      setNotebook((current) => current ? { ...current, ...updates } : current);
+      return;
+    }
     const updated = store.updateNotebook(notebook.id, updates);
     if (updated) setNotebook(updated);
   };
@@ -89,7 +132,7 @@ export default function NotebookDetail({ params }: { params: { id: string } }) {
           'Content-Type': 'application/json'
         },
         body: JSON.stringify({
-          system: "Generate a detailed structured summary of the uploaded document with headers and bullet points.",
+          system: "You are summarizing a user-uploaded document. Cover title, authors, problem, methods, results, and conclusion as ## / ### headings with bullet points. Never dump the paper into one Section/Content table. Use a table only for numeric metrics.",
           messages: [{ role: 'user', content: `<documents>\n${combinedContext}\n</documents>\n\nPlease provide a structured markdown summary of these documents.` }]
         })
       });
@@ -113,7 +156,7 @@ export default function NotebookDetail({ params }: { params: { id: string } }) {
   const handleSendMessage = async () => {
     if (!chatInput.trim() || !notebook) return;
     const activeSources = notebook.sources;
-    if (activeSources.length === 0) return;
+    if (activeSources.length === 0 && !serverConversation) return;
 
     const newMessage: ChatMessage = {
       role: 'user',
@@ -127,6 +170,12 @@ export default function NotebookDetail({ params }: { params: { id: string } }) {
     setIsGenerating(true);
 
     try {
+      if (serverConversation) {
+        await appendConversationMessage(params.id, {
+          role: 'user',
+          content: newMessage.content,
+        });
+      }
       let combinedContext = activeSources.map(s => `Document: ${s.name}\n\n${s.content}`).join('\n\n---\n\n');
       if (combinedContext.length > 8000) {
         combinedContext = combinedContext.slice(0, 8000) + "\n\n[...TRUNCATED DUE TO LENGTH...]";
@@ -147,7 +196,7 @@ export default function NotebookDetail({ params }: { params: { id: string } }) {
           'Content-Type': 'application/json'
         },
         body: JSON.stringify({
-          system: "You are a helpful assistant analyzing user documents. Base your answers ONLY on the provided <documents>. If the answer is not in the documents, say so.",
+          system: "You are a helpful assistant analyzing user documents. Base your answers ONLY on the provided <documents>. If the answer is not in the documents, say so. Always answer with ## headings and bullet lists. Do not write paragraphs. Do not put the whole paper in one table. Use a markdown table only for numeric metrics, with each row on its own line.",
           messages: apiMessages
         })
       });
@@ -159,6 +208,12 @@ export default function NotebookDetail({ params }: { params: { id: string } }) {
           content: data.content?.[0]?.text || "No response.",
           timestamp: new Date().toISOString()
         };
+        if (serverConversation) {
+          await appendConversationMessage(params.id, {
+            role: 'assistant',
+            content: aiMsg.content,
+          });
+        }
         updateNotebookState({ 
           chatHistory: [...updatedHistory, aiMsg],
           summary: aiMsg.content // Pipe chat responses into the Studio Note reactively
@@ -310,10 +365,13 @@ export default function NotebookDetail({ params }: { params: { id: string } }) {
               notebook.chatHistory.map((msg, idx) => (
                 <div key={idx} className={`flex flex-col ${msg.role === 'user' ? 'items-end' : 'items-start'}`}>
                   <div className={`max-w-[85%] rounded-2xl px-4 py-3 ${msg.role === 'user' ? 'bg-neutral-800 text-white rounded-br-sm' : 'bg-transparent border border-white/10 text-neutral-200 rounded-bl-sm'}`}>
-                    <ReactMarkdown className="prose prose-invert prose-sm max-w-none">
-                      {msg.content}
-                    </ReactMarkdown>
+                    <MarkdownContent content={msg.content} />
                   </div>
+                  {msg.role === 'assistant' && msg.sources?.length ? (
+                    <span className="text-[10px] text-blue-300/70 mt-1 px-1">
+                      Sources: {msg.sources.map((source) => String(source.chunk_id || source.document_id || 'reference')).join(', ')}
+                    </span>
+                  ) : null}
                   <span className="text-[10px] text-neutral-500 mt-1 px-1">
                     {new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                   </span>
@@ -343,8 +401,8 @@ export default function NotebookDetail({ params }: { params: { id: string } }) {
                     handleSendMessage();
                   }
                 }}
-                disabled={notebook.sources.length === 0}
-                placeholder={notebook.sources.length === 0 ? "Upload a PDF to start chatting..." : "Ask a question or create something"}
+                disabled={notebook.sources.length === 0 && !serverConversation}
+                placeholder={notebook.sources.length === 0 && !serverConversation ? "Upload a PDF to start chatting..." : "Ask a question or create something"}
                 className="w-full bg-transparent border-none px-4 py-4 text-sm text-white resize-none outline-none min-h-[56px] max-h-32"
                 rows={1}
               />
@@ -356,8 +414,8 @@ export default function NotebookDetail({ params }: { params: { id: string } }) {
                 </div>
                 <button 
                   onClick={handleSendMessage}
-                  disabled={!chatInput.trim() || notebook.sources.length === 0 || isGenerating}
-                  className={`p-2 rounded-full flex items-center justify-center transition-all ${chatInput.trim() && notebook.sources.length > 0 && !isGenerating ? 'bg-blue-600 text-white hover:bg-blue-500' : 'bg-white/5 text-neutral-500'}`}
+                  disabled={!chatInput.trim() || (notebook.sources.length === 0 && !serverConversation) || isGenerating}
+                  className={`p-2 rounded-full flex items-center justify-center transition-all ${chatInput.trim() && (notebook.sources.length > 0 || serverConversation) && !isGenerating ? 'bg-blue-600 text-white hover:bg-blue-500' : 'bg-white/5 text-neutral-500'}`}
                 >
                   <Send className="w-4 h-4" />
                 </button>
@@ -390,7 +448,7 @@ export default function NotebookDetail({ params }: { params: { id: string } }) {
             ) : notebook.summary ? (
               <div className="prose prose-invert prose-sm md:prose-base prose-headings:text-white/90 prose-p:text-neutral-300 prose-li:text-neutral-300 max-w-none">
                 <h1 className="text-2xl font-bold mb-6 pb-2 border-b border-white/10">{notebook.sources[0]?.name || notebook.title}</h1>
-                <ReactMarkdown>{notebook.summary}</ReactMarkdown>
+                <MarkdownContent content={notebook.summary} />
               </div>
             ) : (
               <div className="h-full flex flex-col items-center justify-center text-center">
