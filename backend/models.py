@@ -2,10 +2,8 @@ from datetime import datetime
 from enum import Enum
 from typing import Optional, List
 from uuid import UUID, uuid4
-from sqlalchemy import Column, Enum as SAEnum, ForeignKey
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy import Column, Enum as SAEnum, ForeignKey, JSON, Text
 from sqlmodel import SQLModel, Field, Relationship
-from pgvector.sqlalchemy import Vector
 
 
 class User(SQLModel, table=True):
@@ -26,6 +24,10 @@ class User(SQLModel, table=True):
         back_populates="user",
         sa_relationship_kwargs={"cascade": "all, delete-orphan"}
     )
+    password_reset_tokens: List["PasswordResetToken"] = Relationship(
+        back_populates="user",
+        sa_relationship_kwargs={"cascade": "all, delete-orphan"}
+    )
     conversations: List["Conversation"] = Relationship(
         back_populates="user",
         sa_relationship_kwargs={"cascade": "all, delete-orphan"}
@@ -42,6 +44,19 @@ class RefreshToken(SQLModel, table=True):
     
     # Relationship
     user: Optional[User] = Relationship(back_populates="refresh_tokens")
+
+
+class PasswordResetToken(SQLModel, table=True):
+    """One-time token used to reset a local user's password."""
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: int = Field(foreign_key="user.id", index=True)
+    token_hash: str = Field(unique=True, index=True)
+    expires_at: datetime
+    used: bool = Field(default=False)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+    user: Optional[User] = Relationship(back_populates="password_reset_tokens")
 
 
 class Session(SQLModel, table=True):
@@ -88,8 +103,8 @@ class Chunk(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     document_id: int = Field(foreign_key="document.id", index=True)
     content: str
-    # Vector embedding for dense retrieval (pgvector)
-    embedding: list[float] = Field(sa_column=Column(Vector(dim=1024), nullable=False))
+    # Vector embedding stored as JSON list (SQLite-compatible)
+    embedding: Optional[str] = Field(default=None, sa_column=Column(Text, nullable=True))
     # Full-text search vector for sparse retrieval
     tsv: str = Field(default=None)
     
@@ -155,7 +170,7 @@ class ConversationMessage(SQLModel, table=True):
         )
     )
     content: str = Field(nullable=False)
-    sources: Optional[list[dict]] = Field(default=None, sa_column=Column(JSONB, nullable=True))
+    sources: Optional[list] = Field(default=None, sa_column=Column(JSON, nullable=True))
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
     conversation: Optional[Conversation] = Relationship(back_populates="messages")

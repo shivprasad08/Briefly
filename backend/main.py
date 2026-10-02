@@ -1,4 +1,6 @@
 import os
+import hashlib
+import secrets
 from contextlib import asynccontextmanager
 from pathlib import Path
 import sys
@@ -9,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
+from sqlalchemy import update
 from models import (
     User,
     Session as DBSession,
@@ -18,6 +21,7 @@ from models import (
     Conversation,
     ConversationMessage,
     ConversationMessageRole,
+    PasswordResetToken,
 )
 from database import init_db, get_session, close_db
 from service import ingest_pdf, chat_with_documents
@@ -120,12 +124,26 @@ class GoogleAuthRequest(BaseModel):
     id_token: str
 
 
+class PasswordResetRequest(BaseModel):
+    email: str
+
+
+class PasswordResetConfirm(BaseModel):
+    token: str
+    new_password: str
+
+
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
     refresh_token: str
     user_id: int
     email: str
+
+
+class PasswordResetResponse(BaseModel):
+    message: str
+    reset_token: str | None = None
 
 
 class UserResponse(BaseModel):
@@ -310,7 +328,7 @@ async def signup(
     refresh_token = create_refresh_token()
     
     # Store refresh token
-    expires_at = datetime.now(timezone.utc) + timedelta(days=7)
+    expires_at = datetime.utcnow() + timedelta(days=7)
     db_refresh_token = RefreshToken(
         user_id=user.id,
         token_hash=hash_refresh_token(refresh_token),
@@ -350,7 +368,7 @@ async def login(
     refresh_token = create_refresh_token()
     
     # Store refresh token
-    expires_at = datetime.now(timezone.utc) + timedelta(days=7)
+    expires_at = datetime.utcnow() + timedelta(days=7)
     db_refresh_token = RefreshToken(
         user_id=user.id,
         token_hash=hash_refresh_token(refresh_token),
@@ -366,6 +384,83 @@ async def login(
         "user_id": user.id,
         "email": user.email,
     }
+
+
+@app.post("/auth/password-reset/request", response_model=PasswordResetResponse, dependencies=[Depends(rate_limit)])
+async def request_password_reset(
+    request: PasswordResetRequest,
+    session: AsyncSession = Depends(get_session),
+):
+    """Create a local password reset token without revealing whether an email exists."""
+    result = await session.execute(select(User).where(User.email == request.email))
+    user = result.scalar_one_or_none()
+    response = {
+        "message": "If an account exists for that email, a reset token has been created.",
+        "reset_token": None,
+    }
+    if user is None or user.oauth_provider != "local":
+        return response
+
+    await session.execute(
+        update(PasswordResetToken)
+        .where(
+            (PasswordResetToken.user_id == user.id)
+            & (PasswordResetToken.used == False)
+        )
+        .values(used=True)
+    )
+    raw_token = secrets.token_urlsafe(32)
+    session.add(
+        PasswordResetToken(
+            user_id=user.id,
+            token_hash=hashlib.sha256(raw_token.encode()).hexdigest(),
+            expires_at=datetime.utcnow() + timedelta(minutes=30),
+        )
+    )
+    await session.commit()
+    response["reset_token"] = raw_token
+    return response
+
+
+@app.post("/auth/password-reset/confirm")
+async def confirm_password_reset(
+    request: PasswordResetConfirm,
+    session: AsyncSession = Depends(get_session),
+):
+    """Set a new password using a valid, unused reset token."""
+    if len(request.new_password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters long")
+
+    token_hash = hashlib.sha256(request.token.encode()).hexdigest()
+    result = await session.execute(
+        select(PasswordResetToken).where(
+            PasswordResetToken.token_hash == token_hash
+        )
+    )
+    reset_token = result.scalar_one_or_none()
+    if (
+        reset_token is None
+        or reset_token.used
+        or reset_token.expires_at < datetime.utcnow()
+    ):
+        raise HTTPException(status_code=400, detail="Invalid or expired reset token")
+
+    user_result = await session.execute(select(User).where(User.id == reset_token.user_id))
+    user = user_result.scalar_one_or_none()
+    if user is None or user.oauth_provider != "local":
+        raise HTTPException(status_code=400, detail="Invalid or expired reset token")
+
+    user.hashed_password = get_password_hash(request.new_password)
+    reset_token.used = True
+    await session.execute(
+        update(RefreshToken)
+        .where(RefreshToken.user_id == user.id)
+        .values(revoked=True)
+    )
+    session.add(user)
+    session.add(reset_token)
+    await session.commit()
+    return {"message": "Password reset successfully"}
 
 
 @app.post("/auth/refresh", response_model=TokenResponse)
@@ -385,7 +480,7 @@ async def refresh_token_route(
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
     if db_token.revoked:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token has been revoked")
-    if db_token.expires_at.replace(tzinfo=timezone.utc) < datetime.now(timezone.utc):
+    if db_token.expires_at < datetime.utcnow():
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token expired")
         
     # Get user
@@ -404,7 +499,7 @@ async def refresh_token_route(
     new_access = create_access_token(data={"sub": user.email})
     new_refresh = create_refresh_token()
     
-    expires_at = datetime.now(timezone.utc) + timedelta(days=7)
+    expires_at = datetime.utcnow() + timedelta(days=7)
     new_db_token = RefreshToken(
         user_id=user.id,
         token_hash=hash_refresh_token(new_refresh),
@@ -477,7 +572,7 @@ async def google_auth(
     access_token = create_access_token(data={"sub": user.email})
     refresh_token = create_refresh_token()
     
-    expires_at = datetime.now(timezone.utc) + timedelta(days=7)
+    expires_at = datetime.utcnow() + timedelta(days=7)
     db_refresh_token = RefreshToken(
         user_id=user.id,
         token_hash=hash_refresh_token(refresh_token),

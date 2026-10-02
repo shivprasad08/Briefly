@@ -14,12 +14,12 @@ os.environ["DATABASE_URL"] = f"sqlite+aiosqlite:///{TEST_DATABASE_PATH}"
 from database import async_session, engine
 import database
 import main
-from models import RefreshToken, User
+from models import PasswordResetToken, RefreshToken, User
 from auth import get_password_hash
 from main import app, rate_limit
 
 
-AUTH_TABLES = [User.__table__, RefreshToken.__table__]
+AUTH_TABLES = [User.__table__, RefreshToken.__table__, PasswordResetToken.__table__]
 
 
 async def init_test_db() -> None:
@@ -43,6 +43,7 @@ main.close_db = close_test_db
 async def _clear_database() -> None:
     async with async_session() as session:
         await session.execute(delete(RefreshToken))
+        await session.execute(delete(PasswordResetToken))
         await session.execute(delete(User))
         await session.commit()
 

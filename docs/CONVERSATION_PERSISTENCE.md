@@ -36,3 +36,10 @@ All routes require `Authorization: Bearer <access_token>`.
 The document chat endpoint accepts an optional `conversation_id`. If omitted, it creates one. After retrieval and generation, it stores the user query and assistant answer, including retrieved chunk/document IDs in the assistant `sources` JSONB value, in one transaction.
 
 This phase stores and reloads conversation history only. It does not implement cross-conversation memory or retrieval.
+
+## Password reset
+
+- `POST /auth/password-reset/request` accepts an email and always returns a generic message to avoid account enumeration.
+- `POST /auth/password-reset/confirm` accepts the reset token and a new password of at least eight characters.
+- Tokens are stored hashed, expire after 30 minutes, and can be used once. Existing refresh tokens are revoked after a successful reset.
+- Local development returns `reset_token` directly so the flow works without an email provider. Production should deliver that token through a transactional email service and omit it from the API response.

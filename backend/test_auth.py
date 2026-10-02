@@ -61,3 +61,40 @@ def test_logout(client, test_user):
     refresh_resp = client.post("/auth/refresh", json={"refresh_token": refresh_token})
     assert refresh_resp.status_code == 401
     assert "revoked" in refresh_resp.json()["detail"].lower()
+
+
+def test_password_reset_flow(client, test_user):
+    request_resp = client.post(
+        "/auth/password-reset/request",
+        json={"email": test_user.email},
+    )
+    assert request_resp.status_code == 200
+    reset_token = request_resp.json()["reset_token"]
+    assert reset_token
+
+    confirm_resp = client.post(
+        "/auth/password-reset/confirm",
+        json={"token": reset_token, "new_password": "newpass123"},
+    )
+    assert confirm_resp.status_code == 200
+
+    login_resp = client.post(
+        "/auth/login",
+        json={"email": test_user.email, "password": "newpass123"},
+    )
+    assert login_resp.status_code == 200
+
+    reused_resp = client.post(
+        "/auth/password-reset/confirm",
+        json={"token": reset_token, "new_password": "anotherpass123"},
+    )
+    assert reused_resp.status_code == 400
+
+
+def test_password_reset_does_not_reveal_unknown_email(client):
+    response = client.post(
+        "/auth/password-reset/request",
+        json={"email": "missing@example.com"},
+    )
+    assert response.status_code == 200
+    assert response.json()["reset_token"] is None
